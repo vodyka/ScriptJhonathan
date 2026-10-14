@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kryzer | Liquido Shopee UpSeller
 // @namespace    https://github.com/vodyka/ScriptJhonathan
-// @version      2.0.0
+// @version      2.1.0
 // @description  Exibe o liquido por variacao na criacao de promocoes Shopee no UpSeller.
 // @match        https://app.upseller.com/pt/products/shopee/discount-promotions-create/*
 // @match        https://app.upseller.com/pt/products/shopee/discount-promotions-create/
@@ -108,60 +108,82 @@
     $('kryzer-toggle').textContent = body.hidden ? '+' : '−';
   });
 
-  // Preco promocional: somente a coluna "Preco com Desconto(R$)".
-  // NUNCA ler o campo Nome da Promocao nem os inputs de % OFF.
-  function discountColumn(table) {
-    const header = [...table.querySelectorAll('thead th')];
-    return header.findIndex(th => /pre[cç]o\s+com\s+desconto/i.test(th.textContent || ''));
+  // A grade do UpSeller pode usar divs em vez de linhas HTML <table>.
+  // Procuramos o grupo que contem o preco promocional + 'ou' + '% OFF'.
+  // O primeiro input numerico desse grupo e o preco; o segundo e o percentual.
+  const visible = el => el && el.isConnected && el.getClientRects().length > 0;
+  const editableInputs = node => [...node.querySelectorAll('input')]
+    .filter(x => !['checkbox','radio','hidden','search'].includes(x.type) && !x.disabled);
+
+  function locatePrices() {
+    const found = new Set();
+    // Estrutura de tabela: localiza pela celula do proprio desconto,
+    // sem confiar no indice do cabecalho (colunas fixas/ocultas).
+    document.querySelectorAll('tr, [role="row"]').forEach(row => {
+      if (!visible(row)) return;
+      const cells = [...row.querySelectorAll(':scope > td, :scope > [role="cell"]')];
+      cells.forEach(cell => {
+        if (!/%\s*OFF/i.test(cell.textContent || '')) return;
+        const ins = editableInputs(cell);
+        if (ins.length >= 2 && visible(ins[0])) found.add(ins[0]);
+      });
+    });
+    // Plano alternativo: sobe a arvore de cada campo ate encontrar o
+    // menor container que contem os dois campos e a legenda "% OFF".
+    document.querySelectorAll('input').forEach(input => {
+      if (!visible(input) || ['checkbox','radio','hidden','search'].includes(input.type)) return;
+      let p = input.parentElement;
+      for (let depth = 0; p && depth < 8; depth++, p = p.parentElement) {
+        if (p.id === 'kryzer-liquid-panel' || p === document.body) break;
+        const inputs = editableInputs(p);
+        const label = (p.textContent || '').replace(/\s+/g,' ');
+        if (inputs.length >= 2 && inputs.length <= 4 && /%\s*OFF/i.test(label) && /\bou\b/i.test(label)) {
+          if (inputs[0] === input) found.add(input);
+          break;
+        }
+      }
+    });
+    return [...found];
   }
-  function priceInput(cell) {
-    if (!cell) return null;
-    const inputs = [...cell.querySelectorAll('input:not([type=checkbox]):not([type=hidden])')];
-    return inputs.find(i => i.type !== 'number' || !/%\s*off/i.test(i.parentElement?.textContent || '')) || null;
-  }
-  function setBadge(cell, input) {
+
+  function putLiquidUnderInput(input) {
     const price = number(input.value);
-    let badge = cell.querySelector('.kryzer-liquid-value');
-    if (!badge) {
+    if (!Number.isFinite(price) || price < 0) return false;
+    // Nao altera valor, evento ou atributos do campo controlado pelo React.
+    const host = input.parentElement;
+    if (!host) return false;
+    let badge = host.parentElement.querySelector(':scope > .kryzer-liquid-value');
+    if (!badge || badge.dataset.forInput !== 'yes') {
       badge = document.createElement('span');
       badge.className = 'kryzer-liquid-value';
-      // Anexa ao proprio TD, fora do wrapper do input para nao interromper React.
-      cell.appendChild(badge);
-    }
-    if (!(price >= 0)) {
-      if (badge.textContent !== 'Digite o preco') badge.textContent = 'Digite o preco';
-      return false;
+      badge.dataset.forInput = 'yes';
+      // insere depois do wrapper do preco e antes do texto "ou".
+      host.insertAdjacentElement('afterend', badge);
     }
     const calc = calculate(price);
     const label = 'Liquido: ' + money(calc.liquid);
     const detail = 'Taxas: ' + money(calc.commission + calc.fixed + calc.extra);
-    badge.classList.toggle('negative', calc.liquid < 0);
     const sig = label + '|' + detail;
+    badge.classList.toggle('negative',calc.liquid<0);
+    badge.style.cssText = 'display:block;width:max-content;max-width:140px;font-size:11px;line-height:15px;margin-top:3px;white-space:nowrap;color:'+
+      (calc.liquid<0?'#c42c2c':'#067647')+';font-weight:700';
     if (badge.dataset.sig !== sig) {
       badge.dataset.sig = sig;
-      badge.textContent = label;
+      badge.replaceChildren(document.createTextNode(label));
       const small = document.createElement('small');
       small.textContent = detail;
+      small.style.cssText = 'display:block;font-size:10px;line-height:13px;color:#64748b;font-weight:400';
       badge.appendChild(small);
     }
     return true;
   }
   function updateRows() {
-    let count = 0, foundTable = false;
-    document.querySelectorAll('table').forEach(table => {
-      const index = discountColumn(table);
-      if (index < 0) return;
-      foundTable = true;
-      table.querySelectorAll('tbody tr').forEach(row => {
-        const cells = row.querySelectorAll('td');
-        const cell = cells[index];
-        const input = priceInput(cell);
-        if (input && setBadge(cell, input)) count++;
-      });
-    });
+    const inputs = locatePrices();
+    let count = 0;
+    inputs.forEach(input => { if (putLiquidUnderInput(input)) count++; });
     $('kryzer-status').textContent = count
-      ? count + ' variacao(oes) visivel(is) calculada(s). Edite o preco e o liquido muda automaticamente.'
-      : foundTable ? 'Tabela encontrada; aguardando campos de preco.' : 'Aguardando tabela de promocoes...';
+      ? count + ' variacao(oes) visivel(is) calculada(s).'
+      : 'Aguardando os campos de Preco com Desconto / % OFF...';
   }
 
   let scheduled = false;
